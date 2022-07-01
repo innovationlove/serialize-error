@@ -1,16 +1,10 @@
+import errorConstructors from './error-constructors.js';
+
 export class NonError extends Error {
+	name = 'NonError';
+
 	constructor(message) {
 		super(NonError._prepareSuperMessage(message));
-
-		Object.defineProperty(this, 'name', {
-			value: 'NonError',
-			configurable: true,
-			writable: true,
-		});
-
-		if (Error.captureStackTrace) {
-			Error.captureStackTrace(this, NonError);
-		}
 	}
 
 	static _prepareSuperMessage(message) {
@@ -39,6 +33,10 @@ const commonProperties = [
 		property: 'code',
 		enumerable: true,
 	},
+	{
+		property: 'cause',
+		enumerable: false,
+	},
 ];
 
 const toJsonWasCalled = Symbol('.toJSON was called');
@@ -50,15 +48,29 @@ const toJSON = from => {
 	return json;
 };
 
+const getErrorConstructor = name => errorConstructors.get(name) ?? Error;
+
+// eslint-disable-next-line complexity
 const destroyCircular = ({
 	from,
 	seen,
-	to_,
+	to,
 	forceEnumerable,
 	maxDepth,
 	depth,
+	useToJSON,
+	serialize,
 }) => {
-	const to = to_ || (Array.isArray(from) ? [] : {});
+	if (!to) {
+		if (Array.isArray(from)) {
+			to = [];
+		} else if (!serialize && isErrorLike(from)) {
+			const Error = getErrorConstructor(from.name);
+			to = new Error();
+		} else {
+			to = {};
+		}
+	}
 
 	seen.push(from);
 
@@ -66,9 +78,19 @@ const destroyCircular = ({
 		return to;
 	}
 
-	if (typeof from.toJSON === 'function' && from[toJsonWasCalled] !== true) {
+	if (useToJSON && typeof from.toJSON === 'function' && from[toJsonWasCalled] !== true) {
 		return toJSON(from);
 	}
+
+	const continueDestroyCircular = value => destroyCircular({
+		from: value,
+		seen: [...seen],
+		forceEnumerable,
+		maxDepth,
+		depth,
+		useToJSON,
+		serialize,
+	});
 
 	for (const [key, value] of Object.entries(from)) {
 		// eslint-disable-next-line node/prefer-global/buffer
@@ -94,14 +116,8 @@ const destroyCircular = ({
 
 		if (!seen.includes(from[key])) {
 			depth++;
+			to[key] = continueDestroyCircular(from[key]);
 
-			to[key] = destroyCircular({
-				from: from[key],
-				seen: [...seen],
-				forceEnumerable,
-				maxDepth,
-				depth,
-			});
 			continue;
 		}
 
@@ -109,9 +125,9 @@ const destroyCircular = ({
 	}
 
 	for (const {property, enumerable} of commonProperties) {
-		if (typeof from[property] === 'string') {
+		if (typeof from[property] !== 'undefined' && from[property] !== null) {
 			Object.defineProperty(to, property, {
-				value: from[property],
+				value: isErrorLike(from[property]) ? continueDestroyCircular(from[property]) : from[property],
 				enumerable: forceEnumerable ? true : enumerable,
 				configurable: true,
 				writable: true,
@@ -123,7 +139,10 @@ const destroyCircular = ({
 };
 
 export function serializeError(value, options = {}) {
-	const {maxDepth = Number.POSITIVE_INFINITY} = options;
+	const {
+		maxDepth = Number.POSITIVE_INFINITY,
+		useToJSON = true,
+	} = options;
 
 	if (typeof value === 'object' && value !== null) {
 		return destroyCircular({
@@ -132,13 +151,15 @@ export function serializeError(value, options = {}) {
 			forceEnumerable: true,
 			maxDepth,
 			depth: 0,
+			useToJSON,
+			serialize: true,
 		});
 	}
 
 	// People sometimes throw things besides Error objects…
 	if (typeof value === 'function') {
 		// `JSON.stringify()` discards functions. We do too, unless a function is thrown directly.
-		return `[Function: ${(value.name || 'anonymous')}]`;
+		return `[Function: ${value.name ?? 'anonymous'}]`;
 	}
 
 	return value;
@@ -151,17 +172,34 @@ export function deserializeError(value, options = {}) {
 		return value;
 	}
 
-	if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-		const newError = new Error(); // eslint-disable-line unicorn/error-message
-		destroyCircular({
+	if (isMinimumViableSerializedError(value)) {
+		const Error = getErrorConstructor(value.name);
+		return destroyCircular({
 			from: value,
 			seen: [],
-			to_: newError,
+			to: new Error(),
 			maxDepth,
 			depth: 0,
+			serialize: false,
 		});
-		return newError;
 	}
 
 	return new NonError(value);
 }
+
+export function isErrorLike(value) {
+	return Boolean(value)
+	&& typeof value === 'object'
+	&& 'name' in value
+	&& 'message' in value
+	&& 'stack' in value;
+}
+
+function isMinimumViableSerializedError(value) {
+	return Boolean(value)
+	&& typeof value === 'object'
+	&& 'message' in value
+	&& !Array.isArray(value);
+}
+
+export {default as errorConstructors} from './error-constructors.js';

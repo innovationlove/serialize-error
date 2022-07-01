@@ -1,13 +1,23 @@
 import {Buffer} from 'node:buffer';
 import Stream from 'node:stream';
 import test from 'ava';
-import {serializeError, deserializeError} from './index.js';
+import errorConstructors from './error-constructors.js';
+import {serializeError, deserializeError, isErrorLike} from './index.js';
 
 function deserializeNonError(t, value) {
 	const deserialized = deserializeError(value);
 	t.true(deserialized instanceof Error);
 	t.is(deserialized.constructor.name, 'NonError');
 	t.is(deserialized.message, JSON.stringify(value));
+}
+
+// TODO: Replace with plain `new Error('outer', {cause: new Error('inner')})` when targeting Node 16.9+
+function setErrorCause(error, cause) {
+	Object.defineProperty(error, 'cause', {
+		value: cause,
+		enumerable: false,
+		writable: true,
+	});
 }
 
 test('main', t => {
@@ -131,7 +141,30 @@ test('should serialize nested errors', t => {
 
 	const serialized = serializeError(error);
 	t.is(serialized.message, 'outer error');
-	t.is(serialized.innerError.message, 'inner error');
+	t.like(serialized.innerError, {
+		name: 'Error',
+		message: 'inner error',
+	});
+	t.false(serialized.innerError instanceof Error);
+});
+
+test('should serialize the cause property', t => {
+	const error = new Error('outer error');
+	setErrorCause(error, new Error('inner error'));
+	setErrorCause(error.cause, new Error('deeper error'));
+
+	const serialized = serializeError(error);
+	t.is(serialized.message, 'outer error');
+	t.like(serialized.cause, {
+		name: 'Error',
+		message: 'inner error',
+		cause: {
+			name: 'Error',
+			message: 'deeper error',
+		},
+	});
+	t.false(serialized.cause instanceof Error);
+	t.false(serialized.cause.cause instanceof Error);
 });
 
 test('should handle top-level null values', t => {
@@ -159,10 +192,23 @@ test('should deserialize array', t => {
 	deserializeNonError(t, [1]);
 });
 
+test('should deserialize empty object', t => {
+	deserializeNonError(t, {});
+});
+
+test('should ignore Error instance', t => {
+	const originalError = new Error('test');
+	const deserialized = deserializeError(originalError);
+	t.is(deserialized, originalError);
+});
+
 test('should deserialize error', t => {
-	const deserialized = deserializeError(new Error('test'));
+	const deserialized = deserializeError({
+		message: 'Stuff happened',
+	});
 	t.true(deserialized instanceof Error);
-	t.is(deserialized.message, 'test');
+	t.is(deserialized.name, 'Error');
+	t.is(deserialized.message, 'Stuff happened');
 });
 
 test('should deserialize and preserve existing properties', t => {
@@ -174,6 +220,17 @@ test('should deserialize and preserve existing properties', t => {
 	t.is(deserialized.message, 'foo');
 	t.true(deserialized.customProperty);
 });
+
+for (const [name, CustomError] of errorConstructors) {
+	test(`should deserialize and preserve the ${name} constructor`, t => {
+		const deserialized = deserializeError({
+			name,
+			message: 'foo',
+		});
+		t.true(deserialized instanceof CustomError);
+		t.is(deserialized.message, 'foo');
+	});
+}
 
 test('should deserialize plain object', t => {
 	const object = {
@@ -191,13 +248,55 @@ test('should deserialize plain object', t => {
 	t.is(deserialized.code, 'code');
 });
 
-test('deserialized name, stack and message should not be enumerable, other props should be', t => {
+for (const property of ['cause', 'any']) {
+	// `cause` is treated differently from other properties in the code
+	test(`should deserialize errors on ${property} property`, t => {
+		const object = {
+			message: 'error message',
+			stack: 'at <anonymous>:1:13',
+			name: 'name',
+			code: 'code',
+			[property]: {
+				message: 'source error message',
+				stack: 'at <anonymous>:3:14',
+				name: 'name',
+				code: 'the apple',
+				[property]: {
+					message: 'original error message',
+					stack: 'at <anonymous>:16:9',
+					name: 'name',
+					code: 'the snake',
+				},
+			},
+		};
+
+		const {[property]: nested} = deserializeError(object);
+		t.true(nested instanceof Error);
+		t.is(nested.message, 'source error message');
+		t.is(nested.stack, 'at <anonymous>:3:14');
+		t.is(nested.name, 'name');
+		t.is(nested.code, 'the apple');
+
+		const {[property]: deepNested} = nested;
+		t.true(deepNested instanceof Error);
+		t.is(deepNested.message, 'original error message');
+		t.is(deepNested.stack, 'at <anonymous>:16:9');
+		t.is(deepNested.name, 'name');
+		t.is(deepNested.code, 'the snake');
+	});
+}
+
+test('deserialized name, stack, cause and message should not be enumerable, other props should be', t => {
 	const object = {
 		message: 'error message',
 		stack: 'at <anonymous>:1:13',
 		name: 'name',
+		cause: {
+			message: 'cause error message',
+			stack: 'at <anonymous>:4:20',
+			name: 'name',
+		},
 	};
-	const nonEnumerableProps = Object.keys(object);
 
 	const enumerables = {
 		code: 'code',
@@ -206,18 +305,13 @@ test('deserialized name, stack and message should not be enumerable, other props
 		syscall: 'syscall',
 		randomProperty: 'random',
 	};
-	const enumerableProps = Object.keys(enumerables);
 
 	const deserialized = deserializeError({...object, ...enumerables});
-	const deserializedEnumerableProps = Object.keys(deserialized);
 
-	for (const prop of nonEnumerableProps) {
-		t.false(deserializedEnumerableProps.includes(prop));
-	}
-
-	for (const prop of enumerableProps) {
-		t.true(deserializedEnumerableProps.includes(prop));
-	}
+	t.deepEqual(
+		Object.keys(enumerables),
+		Object.keys(deserialized),
+	);
 });
 
 test('should deserialize properties up to `Options.maxDepth` levels deep', t => {
@@ -276,6 +370,7 @@ test('should serialize custom error with `.toJSON`', t => {
 			};
 		}
 	}
+
 	const error = new CustomError();
 	const serialized = serializeError(error);
 	t.deepEqual(serialized, {
@@ -337,6 +432,32 @@ test('should serialize custom error with `.toJSON` defined with `serializeError`
 	t.not(stack, undefined);
 });
 
+test('should ignore `.toJSON` methods if set in the options', t => {
+	class CustomError extends Error {
+		constructor() {
+			super('foo');
+			this.name = this.constructor.name;
+			this.value = 10;
+		}
+
+		toJSON() {
+			return {
+				message: this.message,
+				amount: `$${this.value}`,
+			};
+		}
+	}
+
+	const error = new CustomError();
+	const serialized = serializeError(error, {useToJSON: false});
+	t.like(serialized, {
+		name: 'CustomError',
+		message: 'foo',
+		value: 10,
+	});
+	t.truthy(serialized.stack);
+});
+
 test('should serialize properties up to `Options.maxDepth` levels deep', t => {
 	const error = new Error('errorMessage');
 	error.one = {two: {three: {}}};
@@ -353,4 +474,27 @@ test('should serialize properties up to `Options.maxDepth` levels deep', t => {
 
 	const levelThree = serializeError(error, {maxDepth: 3});
 	t.deepEqual(levelThree, {message, name, stack, one: {two: {three: {}}}});
+});
+
+test('should identify serialized errors', t => {
+	t.true(isErrorLike(serializeError(new Error('I’m missing more than just your body'))));
+	// eslint-disable-next-line unicorn/error-message -- Testing this eventuality
+	t.true(isErrorLike(serializeError(new Error())));
+	t.true(isErrorLike({
+		name: 'Error',
+		message: 'Is it too late now to say sorry',
+		stack: 'at <anonymous>:3:14',
+	}));
+
+	t.false(isErrorLike({
+		name: 'Bluberricious pancakes',
+		stack: 12,
+		ingredients: 'Blueberry',
+	}));
+
+	t.false(isErrorLike({
+		name: 'Edwin Monton',
+		message: 'We’ve been trying to reach you about your car’s extended warranty',
+		medium: 'Glass bottle in ocean',
+	}));
 });
